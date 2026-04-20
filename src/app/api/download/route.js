@@ -1,18 +1,14 @@
-import { stat } from "node:fs/promises";
-import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
-import { downloadVideo } from "@/lib/ytdlp";
-import { getMimeType, isValidHttpUrl } from "@/lib/utils";
+import { isValidHttpUrl } from "@/lib/utils";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = "edge"; // Can be edge since we're just making HTTP requests
 
 export async function POST(request) {
   try {
     const body = await request.json();
     const url = body?.url?.trim();
-    const formatId = body?.format_id?.trim();
-    const extension = body?.ext?.trim();
+    const isAudioOnly = body?.isAudioOnly === true;
+    const vQuality = body?.vQuality || "720"; // 144, 240, 360, 480, 720, 1080, max
 
     if (!isValidHttpUrl(url)) {
       return NextResponse.json(
@@ -21,35 +17,59 @@ export async function POST(request) {
       );
     }
 
-    if (!formatId) {
-      return NextResponse.json(
-        { error: "Please select a format before downloading." },
-        { status: 400 }
-      );
+    const cobaltUrl = process.env.COBALT_API_URL || "https://api.cobalt.tools/api/json";
+
+    const response = await fetch(cobaltUrl, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url,
+        vCodec: "h264",
+        vQuality,
+        isAudioOnly,
+        // Optional params you can expose later
+        // isNoTTWatermark: true,
+      }),
+    });
+
+    if (!response.ok) {
+      // Handle rate limits or other HTTP errors
+      if (response.status === 429) {
+        throw new Error("Rate limited by Cobalt API. Please try again later.");
+      }
+      throw new Error(`Failed to contact Cobalt API: ${response.statusText}`);
     }
 
-    const download = await downloadVideo(url, formatId, extension);
-    const fileStats = await stat(download.filePath);
-    const stream = download.createStream();
+    const data = await response.json();
 
-    stream.on("close", () => {
-      download.cleanup().catch(() => {});
-    });
+    if (data.status === "error") {
+      let errorMessage = "The video could not be downloaded.";
+      const text = data.text?.toLowerCase() || "";
+      if (text.includes("private")) errorMessage = "This video is private and cannot be downloaded.";
+      else if (text.includes("not found")) errorMessage = "The video could not be found or is unavailable.";
+      else if (text.includes("age")) errorMessage = "This video is age-restricted.";
+      else errorMessage = data.text || errorMessage;
+      
+      return NextResponse.json({ error: errorMessage }, { status: 400 });
+    }
 
-    stream.on("error", () => {
-      download.cleanup().catch(() => {});
-    });
+    // picker indicates multiple files (like an imgur gallery), we'll just return error for simplicity or grab the first
+    if (data.status === "picker") {
+      if (data.picker && data.picker.length > 0) {
+        return NextResponse.json({ url: data.picker[0].url });
+      }
+      return NextResponse.json({ error: "Unsupported media picker format." }, { status: 400 });
+    }
 
-    return new Response(Readable.toWeb(stream), {
-      headers: {
-        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(
-          download.fileName
-        )}`,
-        "Content-Length": fileStats.size.toString(),
-        "Content-Type": getMimeType(extension),
-        "Cache-Control": "no-store",
-      },
-    });
+    // redirect or stream will provide a direct download URL
+    if (data.status === "redirect" || data.status === "stream") {
+      return NextResponse.json({ url: data.url });
+    }
+
+    return NextResponse.json({ error: "Unknown response from Cobalt." }, { status: 500 });
   } catch (error) {
     return NextResponse.json(
       {
