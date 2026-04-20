@@ -1,4 +1,4 @@
-FROM node:18
+FROM node:20
 
 # Install python3, pip, and ffmpeg
 RUN apt-get update && \
